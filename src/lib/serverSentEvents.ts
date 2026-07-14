@@ -21,12 +21,8 @@ export function parseServerSentEventBlock(block: string): string | null {
   return data
 }
 
-function getAbortedSignal(signals: Array<AbortSignal | undefined>) {
-  return signals.find((signal) => signal?.aborted)
-}
-
 export function throwIfAborted(...signals: Array<AbortSignal | undefined>) {
-  const signal = getAbortedSignal(signals)
+  const signal = signals.find((signal) => signal?.aborted)
   if (!signal) return
   throw signal.reason instanceof Error ? signal.reason : new DOMException('请求已停止', 'AbortError')
 }
@@ -39,7 +35,6 @@ export async function readJsonServerSentEvents(
   if (!response.body) throw new Error('接口未返回可读取的流式响应')
 
   const signals = options.signals ?? []
-  const formatErrorMessage = options.formatErrorMessage ?? ((message) => message)
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
@@ -59,7 +54,7 @@ export async function readJsonServerSentEvents(
     try {
       event = JSON.parse(data)
     } catch {
-      throw new Error(formatErrorMessage(data))
+      throw new Error(options.formatErrorMessage?.(data) ?? data)
     }
     if (!event || typeof event !== 'object' || Array.isArray(event)) return
 
@@ -68,7 +63,6 @@ export async function readJsonServerSentEvents(
 
     throwIfAborted(...signals)
     await onEvent(event as Record<string, unknown>)
-    await Promise.resolve()
     throwIfAborted(...signals)
   }
 
@@ -93,7 +87,10 @@ export async function readJsonServerSentEvents(
     buffer += decoder.decode()
     throwIfAborted(...signals)
     if (buffer.trim()) await processBlock(buffer)
-    if (!hasDataLine) throw new Error(formatErrorMessage('未从流式响应中解析到有效的 data 事件'))
+    if (!hasDataLine) {
+      const message = '未从流式响应中解析到有效的 data 事件'
+      throw new Error(options.formatErrorMessage?.(message) ?? message)
+    }
   } finally {
     for (const signal of signals) signal?.removeEventListener('abort', cancelReader)
   }

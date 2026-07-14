@@ -68,10 +68,6 @@ export function cacheThumbnail(id: string, thumbnail: ImageThumbnail) {
   }
 }
 
-export function deleteCachedThumbnail(id: string) {
-  thumbnailCache.delete(id)
-}
-
 export function deleteImageCacheEntry(id: string) {
   imageCache.delete(id)
   thumbnailCache.delete(id)
@@ -130,10 +126,6 @@ export function subscribeImageThumbnail(id: string, callback: (thumbnail: ImageT
   }
 }
 
-function notifyImageThumbnail(id: string, thumbnail: ImageThumbnail) {
-  thumbnailSubscribers.get(id)?.forEach((callback) => callback(thumbnail))
-}
-
 export function scheduleThumbnailBackfill(ids: Iterable<string>, priority: 'visible' | 'background' = 'background') {
   for (const id of ids) {
     if (getCachedThumbnail(id) || thumbnailBackfillRunningIds.has(id)) continue
@@ -163,7 +155,7 @@ async function processNextThumbnailBackfill() {
   if (thumbnailBackfillRunningIds.size > 0) return
 
   const ids = await getNextThumbnailBackfillBatch()
-  for (const id of ids) startThumbnailBackfill(id)
+  for (const id of ids) void startThumbnailBackfill(id)
 
   if (thumbnailBackfillIds.size > 0) scheduleThumbnailBackfillTick()
 }
@@ -198,17 +190,16 @@ function getThumbnailConcurrencyForBatch(sizes: Array<{ width?: number; height?:
     if (!width || !height) return 1
     maxMegapixels = Math.max(maxMegapixels, (width * height) / 1_000_000)
   }
-  const megapixels = maxMegapixels
-  if (megapixels >= 8) return 1
-  if (megapixels >= 4) return 2
-  if (megapixels >= 2) return 3
+  if (maxMegapixels >= 8) return 1
+  if (maxMegapixels >= 4) return 2
+  if (maxMegapixels >= 2) return 3
   return 4
 }
 
-function startThumbnailBackfill(id: string) {
+async function startThumbnailBackfill(id: string) {
   thumbnailBackfillRunningIds.add(id)
 
-  void (async () => {
+  try {
     if (getCachedThumbnail(id)) return
 
     const thumbnail = await getImageThumbnail(id)
@@ -219,16 +210,16 @@ function startThumbnailBackfill(id: string) {
         height: thumbnail.height,
         thumbnailVersion: thumbnail.thumbnailVersion,
       })
-      notifyImageThumbnail(id, {
+      thumbnailSubscribers.get(id)?.forEach((callback) => callback({
         dataUrl: thumbnail.thumbnailDataUrl,
         width: thumbnail.width,
         height: thumbnail.height,
-      })
+      }))
     }
-  })().catch(() => {
+  } catch {
     // 缩略图生成失败时保留占位图，后续仍可再次补全。
-  }).finally(() => {
+  } finally {
     thumbnailBackfillRunningIds.delete(id)
     scheduleThumbnailBackfillTick()
-  })
+  }
 }
