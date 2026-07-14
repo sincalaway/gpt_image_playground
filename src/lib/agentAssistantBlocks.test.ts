@@ -40,6 +40,22 @@ const task = (id: string, patch: Partial<TaskRecord> = {}): TaskRecord => ({
   ...(patch.agentBatchCallId ? { agentBatchCallId: patch.agentBatchCallId } : {}),
 })
 
+const blockOrder = (blocks: AgentAssistantBlock[]) => blocks.map((block) => {
+  if (block.type === 'text') return `text:${block.content}`
+  if (block.type === 'image-task') return `image:${block.task.id}`
+  if (block.type === 'deleted-image-task') return `deleted:${block.taskId}`
+  return block.type
+})
+
+const batchCall = (callId: string, count: number) => ({
+  type: 'function_call',
+  name: 'generate_image_batch',
+  call_id: callId,
+  arguments: JSON.stringify({
+    images: Array.from({ length: count }, (_, index) => ({ id: `image-${index + 1}`, prompt: `prompt-${index + 1}` })),
+  }),
+})
+
 describe('agent assistant blocks', () => {
   it('preserves response output order', () => {
     const imageTask = task('task-1', { agentToolCallId: 'image-1' })
@@ -132,20 +148,104 @@ describe('agent assistant blocks', () => {
     ])
   })
 
-  it('projects batch tasks in round slot order', () => {
-    const firstTask = task('task-first', { agentBatchCallId: 'batch-1' })
-    const secondTask = task('task-second', { agentBatchCallId: 'batch-1' })
+  it.each([
+    {
+      name: 'deleted then live',
+      taskIds: ['task-deleted', 'task-live'],
+      expected: ['text:生成前', 'deleted:task-deleted', 'image:task-live', 'text:生成后'],
+    },
+    {
+      name: 'live then deleted',
+      taskIds: ['task-live', 'task-deleted'],
+      expected: ['text:生成前', 'image:task-live', 'deleted:task-deleted', 'text:生成后'],
+    },
+  ])('projects partial batch slots in original order: $name', ({ taskIds, expected }) => {
+    const liveTask = task('task-live', { agentBatchCallId: 'batch-1' })
     const currentRound = round({
-      outputTaskIds: [secondTask.id, firstTask.id],
-      responseOutput: [{ type: 'function_call', name: 'generate_image_batch', call_id: 'batch-1' }],
+      outputTaskIds: taskIds,
+      responseOutput: [
+        { type: 'message', content: [{ text: '生成前' }] },
+        batchCall('batch-1', 2),
+        { type: 'message', content: [{ text: '生成后' }] },
+      ],
     })
-    const tasks = [firstTask, secondTask]
 
-    const blocks = getAgentAssistantBlocks(currentRound, getRoundTaskSlots(currentRound, tasks), tasks, false)
+    const blocks = getAgentAssistantBlocks(currentRound, getRoundTaskSlots(currentRound, [liveTask]), [liveTask], true)
 
-    expect(blocks.map((block) => block.type === 'image-task' ? block.task.id : block.type)).toEqual([
-      secondTask.id,
-      firstTask.id,
+    expect(blockOrder(blocks)).toEqual(expected)
+  })
+
+  it('renders an entirely deleted batch at the batch output position', () => {
+    const currentRound = round({
+      outputTaskIds: ['task-deleted-1', 'task-deleted-2'],
+      responseOutput: [
+        { type: 'message', content: [{ text: '生成前' }] },
+        batchCall('batch-1', 2),
+        { type: 'message', content: [{ text: '生成后' }] },
+      ],
+    })
+
+    const blocks = getAgentAssistantBlocks(currentRound, getRoundTaskSlots(currentRound, []), [], true)
+
+    expect(blockOrder(blocks)).toEqual([
+      'text:生成前',
+      'deleted:task-deleted-1',
+      'deleted:task-deleted-2',
+      'text:生成后',
+    ])
+  })
+
+  it('de-duplicates repeated batch calls and task slots', () => {
+    const liveTask = task('task-live', { agentBatchCallId: 'batch-1' })
+    const call = batchCall('batch-1', 2)
+    const currentRound = round({
+      outputTaskIds: ['task-deleted', liveTask.id, 'task-deleted', liveTask.id],
+      responseOutput: [call, call],
+    })
+
+    const blocks = getAgentAssistantBlocks(currentRound, getRoundTaskSlots(currentRound, [liveTask]), [liveTask], false)
+
+    expect(blockOrder(blocks)).toEqual(['deleted:task-deleted', 'image:task-live'])
+  })
+
+  it('places scrubbed built-in image slots around the nearest surviving call', () => {
+    const liveTask = task('task-live', { agentToolCallId: 'image-live' })
+    const currentRound = round({
+      outputTaskIds: ['task-deleted-before', liveTask.id, 'task-deleted-after'],
+      responseOutput: [
+        { type: 'message', content: [{ text: '生成前' }] },
+        { type: 'image_generation_call', id: 'image-live' },
+        { type: 'message', content: [{ text: '生成后' }] },
+      ],
+    })
+
+    const blocks = getAgentAssistantBlocks(currentRound, getRoundTaskSlots(currentRound, [liveTask]), [liveTask], true)
+
+    expect(blockOrder(blocks)).toEqual([
+      'text:生成前',
+      'deleted:task-deleted-before',
+      'image:task-live',
+      'deleted:task-deleted-after',
+      'text:生成后',
+    ])
+  })
+
+  it('appends scrubbed built-in slots in task order when no output anchor remains', () => {
+    const currentRound = round({
+      outputTaskIds: ['task-deleted-1', 'task-deleted-2'],
+      responseOutput: [
+        { type: 'message', content: [{ text: '生成前' }] },
+        { type: 'message', content: [{ text: '生成后' }] },
+      ],
+    })
+
+    const blocks = getAgentAssistantBlocks(currentRound, getRoundTaskSlots(currentRound, []), [], true)
+
+    expect(blockOrder(blocks)).toEqual([
+      'text:生成前',
+      'text:生成后',
+      'deleted:task-deleted-1',
+      'deleted:task-deleted-2',
     ])
   })
 

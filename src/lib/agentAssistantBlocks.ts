@@ -24,19 +24,32 @@ function markToolStatusStopped(status: AgentWebSearchStatus): AgentWebSearchStat
   return { text: status.text.replace(/^正在/, '已停止'), completed: true }
 }
 
-function getImageTaskForOutputItem(item: ResponsesOutputItem, tasksForRound: TaskRecord[]) {
+function taskMatchesImageOutputItem(task: TaskRecord, item: ResponsesOutputItem) {
   if (item.type === 'image_generation_call') {
-    return tasksForRound.find((task) => task.agentToolCallId && task.agentToolCallId === item.id) ?? null
+    return Boolean(task.agentToolCallId && task.agentToolCallId === item.id)
   }
   if (item.type === 'function_call' && item.name === 'generate_image' && item.call_id) {
-    return tasksForRound.find((task) => task.agentToolCallId === item.call_id) ?? null
+    return task.agentToolCallId === item.call_id
   }
-  return null
+  if (item.type === 'function_call' && item.name === 'generate_image_batch' && item.call_id) {
+    return task.agentBatchCallId === item.call_id
+  }
+  return false
 }
 
-function getBatchImageTasksForOutputItem(item: ResponsesOutputItem, tasksForRound: TaskRecord[]) {
-  if (item.type !== 'function_call' || item.name !== 'generate_image_batch' || !item.call_id) return []
-  return tasksForRound.filter((task) => task.agentBatchCallId === item.call_id)
+function getBatchImageCount(item: ResponsesOutputItem) {
+  if (item.type !== 'function_call' || item.name !== 'generate_image_batch' || !item.arguments) return 0
+  try {
+    const parsed = JSON.parse(item.arguments) as { images?: unknown }
+    if (!Array.isArray(parsed.images)) return 0
+    return parsed.images.filter((value) => {
+      if (!value || typeof value !== 'object') return false
+      const prompt = (value as Record<string, unknown>).prompt
+      return typeof prompt === 'string' && Boolean(prompt.trim())
+    }).length
+  } catch {
+    return 0
+  }
 }
 
 function getTextFromOutputItem(item: ResponsesOutputItem) {
@@ -50,7 +63,12 @@ function getTextFromOutputItem(item: ResponsesOutputItem) {
 
 export function getAgentAssistantBlocks(round: AgentRound | null, taskSlots: AgentRoundTaskSlot[], allTasks: TaskRecord[], hasText: boolean): AgentAssistantBlock[] {
   const outputItems = getAgentRoundOutputItems(round, allTasks)
-  const tasksForRound = taskSlots.map((slot) => slot.task).filter(Boolean) as TaskRecord[]
+  const slotIds = new Set<string>()
+  const uniqueTaskSlots = taskSlots.filter((slot) => {
+    if (slotIds.has(slot.taskId)) return false
+    slotIds.add(slot.taskId)
+    return true
+  })
   const roundInterrupted = isAgentRoundInterrupted(round)
   const blocks: AgentAssistantBlock[] = []
   const renderedTaskIds = new Set<string>()
@@ -64,11 +82,91 @@ export function getAgentAssistantBlocks(round: AgentRound | null, taskSlots: Age
 
   if (outputItems.length === 0) {
     if (hasText) blocks.push({ type: 'text', key: 'text:fallback' })
-    for (const slot of taskSlots) pushTaskSlot(slot)
+    for (const slot of uniqueTaskSlots) pushTaskSlot(slot)
     return blocks
   }
 
-  const renderedImageCalls = new Set<string>()
+  const imageCallProjections: Array<{
+    outputIndex: number
+    start: number
+    end: number
+    before: AgentRoundTaskSlot[]
+    slots: AgentRoundTaskSlot[]
+    after: AgentRoundTaskSlot[]
+  }> = []
+  const duplicateImageCallIndexes = new Set<number>()
+  const imageCallKeys = new Set<string>()
+  let nextSlotIndex = 0
+
+  for (const [outputIndex, item] of outputItems.entries()) {
+    const singleImageCall = item.type === 'image_generation_call' || (item.type === 'function_call' && item.name === 'generate_image')
+    const batchImageCall = item.type === 'function_call' && item.name === 'generate_image_batch'
+    if (!singleImageCall && !batchImageCall) continue
+
+    const imageCallKey = item.type === 'image_generation_call' && item.id
+      ? `image_generation_call:${item.id}`
+      : item.type === 'function_call' && item.call_id
+      ? `${item.name}:${item.call_id}`
+      : null
+    if (imageCallKey && imageCallKeys.has(imageCallKey)) {
+      duplicateImageCallIndexes.add(outputIndex)
+      continue
+    }
+    if (imageCallKey) imageCallKeys.add(imageCallKey)
+
+    const matchingIndexes = uniqueTaskSlots
+      .map((slot, index) => slot.task && taskMatchesImageOutputItem(slot.task, item) ? index : -1)
+      .filter((index) => index >= 0)
+    const expectedTaskCount = singleImageCall ? 1 : Math.max(getBatchImageCount(item), matchingIndexes.length)
+    const taskCount = expectedTaskCount > uniqueTaskSlots.length && matchingIndexes.length > 0
+      ? matchingIndexes.length
+      : expectedTaskCount
+    if (taskCount === 0 || taskCount > uniqueTaskSlots.length) continue
+
+    let start = -1
+    for (let candidate = nextSlotIndex; candidate + taskCount <= uniqueTaskSlots.length; candidate += 1) {
+      const candidateSlots = uniqueTaskSlots.slice(candidate, candidate + taskCount)
+      if (candidateSlots.some((slot) => slot.task && !taskMatchesImageOutputItem(slot.task, item))) continue
+      if (matchingIndexes.some((index) => index < candidate || index >= candidate + taskCount)) continue
+      start = candidate
+      break
+    }
+    if (start < 0) continue
+
+    const end = start + taskCount
+    imageCallProjections.push({
+      outputIndex,
+      start,
+      end,
+      before: [],
+      slots: uniqueTaskSlots.slice(start, end),
+      after: [],
+    })
+    nextSlotIndex = end
+  }
+
+  const projectedTaskIds = new Set(imageCallProjections.flatMap((projection) => projection.slots.map((slot) => slot.taskId)))
+  // 被清洗的内置调用已无精确位置：中间和尾部槽贴前一调用，首段槽贴下一调用。
+  for (const [slotIndex, slot] of uniqueTaskSlots.entries()) {
+    if (slot.task || projectedTaskIds.has(slot.taskId)) continue
+    let previous: (typeof imageCallProjections)[number] | undefined
+    for (const projection of imageCallProjections) {
+      if (projection.end > slotIndex) break
+      previous = projection
+    }
+    if (previous) {
+      previous.after.push(slot)
+      projectedTaskIds.add(slot.taskId)
+      continue
+    }
+    const next = imageCallProjections.find((projection) => projection.start > slotIndex)
+    if (next) {
+      next.before.push(slot)
+      projectedTaskIds.add(slot.taskId)
+    }
+  }
+
+  const imageCallProjectionByOutputIndex = new Map(imageCallProjections.map((projection) => [projection.outputIndex, projection]))
   let renderedTextBlocks = 0
   let webSearchGroup: ResponsesOutputItem[] = []
   let webSearchGroupStart = -1
@@ -91,32 +189,17 @@ export function getAgentAssistantBlocks(round: AgentRound | null, taskSlots: Age
     flushWebSearchGroup()
 
     const singleImageCall = item.type === 'image_generation_call' || (item.type === 'function_call' && item.name === 'generate_image')
-    const imageCallKey = item.type === 'image_generation_call' && item.id
-      ? `image_generation_call:${item.id}`
-      : item.type === 'function_call' && item.name === 'generate_image' && item.call_id
-      ? `generate_image:${item.call_id}`
-      : null
-    if (singleImageCall && imageCallKey && renderedImageCalls.has(imageCallKey)) continue
-    if (singleImageCall && imageCallKey) renderedImageCalls.add(imageCallKey)
+    const batchImageCall = item.type === 'function_call' && item.name === 'generate_image_batch'
+    if (duplicateImageCallIndexes.has(outputIndex)) continue
 
-    const imageTask = getImageTaskForOutputItem(item, tasksForRound)
-    if (imageTask) {
-      pushTaskSlot({ taskId: imageTask.id, task: imageTask })
+    const projection = imageCallProjectionByOutputIndex.get(outputIndex)
+    if (projection) {
+      for (const slot of [...projection.before, ...projection.slots, ...projection.after]) pushTaskSlot(slot)
       continue
     }
-    if (singleImageCall) {
-      const deletedSlot = taskSlots.find((slot) => !slot.task && !renderedTaskIds.has(slot.taskId))
-      if (deletedSlot) pushTaskSlot(deletedSlot)
-      continue
-    }
+    if (singleImageCall) continue
 
-    const batchImageTasks = getBatchImageTasksForOutputItem(item, tasksForRound)
-    if (batchImageTasks.length > 0) {
-      for (const task of batchImageTasks) pushTaskSlot({ taskId: task.id, task })
-      continue
-    }
-
-    if ((round?.status === 'running' || roundInterrupted) && item.type === 'function_call' && item.name === 'generate_image_batch') {
+    if ((round?.status === 'running' || roundInterrupted) && batchImageCall) {
       blocks.push({
         type: 'batch-params',
         status: roundInterrupted
@@ -139,7 +222,7 @@ export function getAgentAssistantBlocks(round: AgentRound | null, taskSlots: Age
   flushWebSearchGroup()
 
   if (hasText && renderedTextBlocks === 0) blocks.push({ type: 'text', key: 'text:fallback' })
-  for (const slot of taskSlots) pushTaskSlot(slot)
+  for (const slot of uniqueTaskSlots) pushTaskSlot(slot)
   return blocks
 }
 
