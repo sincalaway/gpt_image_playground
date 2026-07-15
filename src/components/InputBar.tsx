@@ -1,6 +1,6 @@
 import { useRef, useEffect, useCallback, useState, useMemo, useLayoutEffect } from 'react'
 import { createPortal } from 'react-dom'
-import { ALL_FAVORITES_COLLECTION_ID, deleteFavoriteCollection, getTaskFavoriteCollectionIds, useStore, submitTask, submitAgentMessage, stopAgentResponse, addImageFromFile, createInputImageFromFile, deleteImageIfUnreferenced, removeMultipleTasks, taskMatchesFilterStatus, taskMatchesSearchQuery } from '../store'
+import { deleteFavoriteCollection, useStore, submitTask, submitAgentMessage, stopAgentResponse, addImageFromFile, createInputImageFromFile, deleteImageIfUnreferenced, removeMultipleTasks, taskMatchesFilterStatus, taskMatchesSearchQuery } from '../store'
 import { DEFAULT_PARAMS, type TaskRecord } from '../types'
 import { getActiveAgentRounds } from '../lib/agentConversationState'
 import { getActiveApiProfile, getAgentImageApiProfile, normalizeSettings } from '../lib/apiProfiles'
@@ -11,6 +11,7 @@ import { normalizeImageSize } from '../lib/size'
 import { createMaskPreviewDataUrl } from '../lib/canvasImage'
 import { getSafeBoundingClientRect } from '../lib/domRect'
 import { collectAgentRoundOutputImageSlots } from '../lib/agentImageReferences'
+import { ALL_FAVORITES_COLLECTION_ID, getTaskFavoriteCollectionIds } from '../lib/favoriteState'
 import { getContentEditableCursor, getContentEditablePlainText, getContentEditableSelection, getMentionTagHtml, setContentEditableCursor, setContentEditableSelection, syncMentionTagSelection } from '../lib/contentEditableMentions'
 import { useHintTooltip } from '../hooks/useHintTooltip'
 import { downloadImageEntriesAsZip, downloadImageIds, formatExportFileTime, getTaskOutputImageZipEntries } from '../lib/downloadImages'
@@ -24,10 +25,10 @@ import InputParamsPanel from './input/inputParamsPanel'
 /** API 支持的最大参考图数量 */
 const API_MAX_IMAGES = 16
 
-function getFavoriteCollectionTasksForBatch(collectionId: string, tasks: TaskRecord[]) {
+function getFavoriteCollectionTasksForBatch(collectionId: string, tasks: TaskRecord[], defaultFavoriteCollectionId: string | null) {
   const favoriteTasks = tasks.filter((task) => task.isFavorite)
   if (collectionId === ALL_FAVORITES_COLLECTION_ID) return favoriteTasks
-  return favoriteTasks.filter((task) => getTaskFavoriteCollectionIds(task).includes(collectionId))
+  return favoriteTasks.filter((task) => getTaskFavoriteCollectionIds(task, defaultFavoriteCollectionId).includes(collectionId))
 }
 
 function delay(ms: number) {
@@ -107,6 +108,7 @@ export default function InputBar() {
   const clearFavoriteCollectionSelection = useStore((s) => s.clearFavoriteCollectionSelection)
   const tasks = useStore((s) => s.tasks)
   const favoriteCollections = useStore((s) => s.favoriteCollections)
+  const defaultFavoriteCollectionId = useStore((s) => s.defaultFavoriteCollectionId)
   const agentConversations = useStore((s) => s.agentConversations)
   const activeAgentConversationId = useStore((s) => s.activeAgentConversationId)
   const filterStatus = useStore((s) => s.filterStatus)
@@ -122,12 +124,12 @@ export default function InputBar() {
     return sorted.filter((t) => {
       if (filterFavorite) {
         if (!t.isFavorite) return false
-        if (activeFavoriteCollectionId && activeFavoriteCollectionId !== ALL_FAVORITES_COLLECTION_ID && !getTaskFavoriteCollectionIds(t).includes(activeFavoriteCollectionId)) return false
+        if (activeFavoriteCollectionId && activeFavoriteCollectionId !== ALL_FAVORITES_COLLECTION_ID && !getTaskFavoriteCollectionIds(t, defaultFavoriteCollectionId).includes(activeFavoriteCollectionId)) return false
       }
       if (!taskMatchesFilterStatus(t, filterStatus)) return false
       return taskMatchesSearchQuery(t, q)
     })
-  }, [tasks, searchQuery, filterStatus, filterFavorite, activeFavoriteCollectionId])
+  }, [tasks, searchQuery, filterStatus, filterFavorite, activeFavoriteCollectionId, defaultFavoriteCollectionId])
 
   const inCollectionOverview = filterFavorite && !activeFavoriteCollectionId
 
@@ -136,16 +138,16 @@ export default function InputBar() {
       {
         id: ALL_FAVORITES_COLLECTION_ID,
         name: '全部',
-        tasks: getFavoriteCollectionTasksForBatch(ALL_FAVORITES_COLLECTION_ID, tasks),
+        tasks: getFavoriteCollectionTasksForBatch(ALL_FAVORITES_COLLECTION_ID, tasks, defaultFavoriteCollectionId),
       },
       ...favoriteCollections.map((collection) => ({
         id: collection.id,
         name: collection.name,
         collection,
-        tasks: getFavoriteCollectionTasksForBatch(collection.id, tasks),
+        tasks: getFavoriteCollectionTasksForBatch(collection.id, tasks, defaultFavoriteCollectionId),
       })),
     ]
-  }, [favoriteCollections, tasks])
+  }, [defaultFavoriteCollectionId, favoriteCollections, tasks])
 
   const filteredFavoriteCollectionCards = useMemo(() => {
     if (!searchQuery.trim()) return favoriteCollectionCards
@@ -284,7 +286,7 @@ export default function InputBar() {
     const selectedCollectionIds = new Set(selectedCollections.map((collection) => collection.id))
     const imageCount = new Set(
       tasks
-        .filter((task) => getTaskFavoriteCollectionIds(task).some((id) => selectedCollectionIds.has(id)))
+        .filter((task) => getTaskFavoriteCollectionIds(task, defaultFavoriteCollectionId).some((id) => selectedCollectionIds.has(id)))
         .flatMap((task) => task.outputImages || []),
     ).size
     setConfirmDialog({
@@ -303,7 +305,7 @@ export default function InputBar() {
         clearFavoriteCollectionSelection()
       },
     })
-  }, [clearFavoriteCollectionSelection, favoriteCollections, selectedFavoriteCollectionIds, setConfirmDialog, showToast, tasks])
+  }, [clearFavoriteCollectionSelection, defaultFavoriteCollectionId, favoriteCollections, selectedFavoriteCollectionIds, setConfirmDialog, showToast, tasks])
 
   const maskDraft = useStore((s) => s.maskDraft)
   const setMaskEditorImageId = useStore((s) => s.setMaskEditorImageId)
