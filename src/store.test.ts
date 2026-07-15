@@ -20,9 +20,9 @@ vi.mock('./lib/db', () => {
       tasks.set(task.id, task)
       return task.id
     },
-    deleteTask: async (id: string) => {
+    deleteTask: vi.fn(async (id: string) => {
       tasks.delete(id)
-    },
+    }),
     commitTaskDeletion: vi.fn(async (deletedTaskIds: string[], updatedTasks: TaskRecord[], updatedConversations: AgentConversation[]) => {
       for (const id of deletedTaskIds) tasks.delete(id)
       for (const task of updatedTasks) tasks.set(task.id, task)
@@ -128,7 +128,7 @@ vi.mock('./lib/agentApi', async (importOriginal) => {
     })),
   }
 })
-import { clearAgentConversations, clearImages, clearTasks, commitTaskDeletion, deleteImage as deleteDbImage, getAllAgentConversations, getAllImageIds, getAllTasks, getImage, getStoredFreshImageThumbnail, putAgentConversation, putImage, putImageThumbnail, putTask as putDbTask } from './lib/db'
+import { clearAgentConversations, clearImages, clearTasks, commitTaskDeletion, deleteImage as deleteDbImage, deleteTask as deleteDbTask, getAllAgentConversations, getAllImageIds, getAllTasks, getImage, getStoredFreshImageThumbnail, putAgentConversation, putImage, putImageThumbnail, putTask as putDbTask } from './lib/db'
 import { callImageApi } from './lib/api'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
 import { getFalQueuedImageResult } from './lib/falAiImageApi'
@@ -137,6 +137,7 @@ import { cleanStaleAgentInputDrafts, clearFailedTasks, deleteFavoriteCollection,
 
 const commitTaskDeletionImplementation = vi.mocked(commitTaskDeletion).getMockImplementation()!
 const deleteDbImageImplementation = vi.mocked(deleteDbImage).getMockImplementation()!
+const deleteDbTaskImplementation = vi.mocked(deleteDbTask).getMockImplementation()!
 const callBatchImageSingleImplementation = vi.mocked(callBatchImageSingle).getMockImplementation()!
 
 const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
@@ -823,6 +824,79 @@ describe('fal task recovery', () => {
     expect(originalImage?.dataUrl).toBe('data:image/png;base64,fal-recovered')
   })
 
+  it('deletes a normalized error round with an in-flight recoverable task without reviving it', async () => {
+    const agentTask = task({
+      id: 'agent-restart-task',
+      apiProvider: 'fal',
+      apiProfileId: 'fal-profile',
+      apiProfileName: 'fal',
+      apiModel: 'fal-model',
+      status: 'error',
+      error: '等待自动恢复',
+      falRequestId: 'restart-request-id',
+      falEndpoint: 'fal-endpoint',
+      falRecoverable: true,
+      sourceMode: 'agent',
+      agentConversationId: 'conversation-a',
+      agentRoundId: 'round-a',
+      agentMessageId: 'assistant-a',
+    })
+    const conversation = agentConversation({
+      id: 'conversation-a',
+      activeRoundId: 'round-a',
+      rounds: [{
+        id: 'round-a',
+        index: 1,
+        parentRoundId: null,
+        userMessageId: 'user-a',
+        assistantMessageId: 'assistant-a',
+        prompt: '重启恢复',
+        inputImageIds: [],
+        outputTaskIds: [agentTask.id],
+        status: 'running',
+        error: null,
+        createdAt: 1,
+        finishedAt: null,
+      }],
+      messages: [
+        { id: 'user-a', role: 'user', content: '重启恢复', roundId: 'round-a', createdAt: 1 },
+        { id: 'assistant-a', role: 'assistant', content: '', roundId: 'round-a', outputTaskIds: [agentTask.id], createdAt: 2 },
+      ],
+    })
+    const recovery = deferred<Awaited<ReturnType<typeof getFalQueuedImageResult>>>()
+    vi.mocked(getFalQueuedImageResult).mockImplementationOnce(() => recovery.promise)
+    await putDbTask(agentTask)
+    await putAgentConversation(conversation)
+
+    await initStore()
+    await vi.waitFor(() => expect(getFalQueuedImageResult).toHaveBeenCalledTimes(1))
+    expect(useStore.getState().agentConversations[0].rounds[0]).toMatchObject({
+      status: 'error',
+      error: '上次请求已中断',
+    })
+
+    const result = await useStore.getState().deleteAgentRound('conversation-a', 'round-a')
+
+    expect(result).toBe('deleted')
+    expect(useStore.getState().tasks).toEqual([])
+    expect(useStore.getState().agentConversations[0].rounds).toEqual([])
+    expect(useStore.getState().agentConversations[0].messages).toEqual([])
+
+    recovery.resolve({
+      images: ['data:image/png;base64,late-recovery'],
+      actualParams: {},
+      actualParamsList: [{}],
+      revisedPrompts: [],
+    })
+    await recovery.promise
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(useStore.getState().tasks).toEqual([])
+    expect(useStore.getState().agentConversations[0].rounds).toEqual([])
+    expect(useStore.getState().agentConversations[0].messages).toEqual([])
+    expect(await getAllImageIds()).toEqual([])
+  })
+
   it('continues an Agent round after all fal image tasks recover', async () => {
     const textProfile = createDefaultOpenAIProfile({ id: 'agent-text-profile', apiKey: 'text-key', apiMode: 'responses' })
     const imageProfile = createDefaultFalProfile({ id: 'fal-profile', apiKey: 'fal-key' })
@@ -875,12 +949,8 @@ describe('fal task recovery', () => {
       actualParamsList: [{}],
       revisedPrompts: [],
     })
-    vi.mocked(callAgentResponsesApi).mockResolvedValueOnce({
-      text: '已完成。',
-      images: [],
-      outputItems: [{ type: 'message', content: [{ type: 'output_text', text: '已完成。' }] }],
-      responseId: 'response-done',
-    })
+    const continuation = deferred<Awaited<ReturnType<typeof callAgentResponsesApi>>>()
+    vi.mocked(callAgentResponsesApi).mockImplementationOnce(() => continuation.promise)
     useStore.setState({
       settings: normalizeSettings({
         ...DEFAULT_SETTINGS,
@@ -899,6 +969,15 @@ describe('fal task recovery', () => {
     await putAgentConversation(conversation)
 
     await initStore()
+    await vi.waitFor(() => expect(callAgentResponsesApi).toHaveBeenCalledTimes(1))
+    expect(useStore.getState().agentConversations[0].rounds[0]).toMatchObject({ status: 'running', error: null })
+    expect(await useStore.getState().deleteAgentRound(conversation.id, 'round-a')).toBe('running')
+    continuation.resolve({
+      text: '已完成。',
+      images: [],
+      outputItems: [{ type: 'message', content: [{ type: 'output_text', text: '已完成。' }] }],
+      responseId: 'response-done',
+    })
     await vi.waitFor(() => expect(useStore.getState().agentConversations[0]?.rounds[0]?.status).toBe('done'))
 
     const recoveredTask = useStore.getState().tasks.find((item) => item.id === agentTask.id)
@@ -1485,6 +1564,391 @@ describe('agent round deletion', () => {
 
     expect(remapAgentRoundMentionsForPathChange('继续参考 @第1轮图1、@第2轮图1、@第3轮图1', oldPath, newPath))
       .toBe('继续参考 @第1轮图1、@已删除轮次图1、@第2轮图1')
+  })
+
+  it('deletes a round and tasks added after the confirmation snapshot from the latest state', async () => {
+    const deleteRound = useStore.getState().deleteAgentRound
+    const latestConversation = agentConversation({
+      activeRoundId: 'round-3',
+      rounds: [
+        {
+          id: 'round-1',
+          index: 1,
+          parentRoundId: null,
+          userMessageId: 'user-1',
+          prompt: '第一轮',
+          inputImageIds: [],
+          outputTaskIds: [],
+          status: 'done',
+          error: null,
+          createdAt: 1,
+          finishedAt: 2,
+        },
+        {
+          id: 'round-2',
+          index: 2,
+          parentRoundId: 'round-1',
+          userMessageId: 'user-2',
+          prompt: '第二轮',
+          inputImageIds: [],
+          outputTaskIds: ['task-before-confirm'],
+          status: 'done',
+          error: null,
+          createdAt: 3,
+          finishedAt: 4,
+        },
+        {
+          id: 'round-3',
+          index: 3,
+          parentRoundId: 'round-2',
+          userMessageId: 'user-3',
+          prompt: '第三轮',
+          inputImageIds: [],
+          outputTaskIds: [],
+          status: 'done',
+          error: null,
+          createdAt: 5,
+          finishedAt: 6,
+        },
+      ],
+      messages: [
+        { id: 'user-1', role: 'user', content: '第一轮', roundId: 'round-1', createdAt: 1 },
+        { id: 'user-2', role: 'user', content: '第二轮', roundId: 'round-2', createdAt: 3 },
+        { id: 'user-3', role: 'user', content: '保留 @第3轮图1', roundId: 'round-3', createdAt: 5 },
+      ],
+    })
+    const unrelatedConversation = agentConversation({ id: 'conversation-b', title: '并发新增对话' })
+    useStore.setState({
+      appMode: 'agent',
+      agentConversations: [latestConversation, unrelatedConversation],
+      activeAgentConversationId: latestConversation.id,
+      prompt: '继续参考 @第1轮图1、@第2轮图1、@第3轮图1',
+      agentInputDrafts: {
+        [latestConversation.id]: {
+          prompt: '草稿参考 @第2轮图1 和 @第3轮图1',
+          inputImages: [imageA],
+          maskDraft: null,
+          maskEditorImageId: null,
+          updatedAt: 99,
+        },
+      },
+      agentEditingRoundId: 'round-2',
+      tasks: [
+        task({ id: 'task-before-confirm', sourceMode: 'agent', agentConversationId: latestConversation.id, agentRoundId: 'round-2' }),
+        task({ id: 'task-unrelated' }),
+      ],
+    })
+    useStore.setState((state) => ({
+      tasks: [
+        task({ id: 'task-after-confirm', sourceMode: 'agent', agentConversationId: latestConversation.id, agentRoundId: 'round-2' }),
+        ...state.tasks,
+      ],
+    }))
+
+    const result = await deleteRound(latestConversation.id, 'round-2')
+
+    const state = useStore.getState()
+    const updated = state.agentConversations.find((item) => item.id === latestConversation.id)!
+    expect(updated.rounds.map((round) => ({ id: round.id, index: round.index, parentRoundId: round.parentRoundId }))).toEqual([
+      { id: 'round-1', index: 1, parentRoundId: null },
+      { id: 'round-3', index: 2, parentRoundId: 'round-1' },
+    ])
+    expect(updated.activeRoundId).toBe('round-3')
+    expect(updated.messages.map((message) => message.id)).toEqual(['user-1', 'user-3'])
+    expect(updated.messages.find((message) => message.id === 'user-3')?.content).toBe('保留 @第2轮图1')
+    expect(state.prompt).toBe('继续参考 @第1轮图1、@已删除轮次图1、@第2轮图1')
+    expect(state.agentInputDrafts[latestConversation.id]).toMatchObject({
+      prompt: '草稿参考 @已删除轮次图1 和 @第2轮图1',
+      inputImages: [imageA],
+      updatedAt: 99,
+    })
+    expect(state.agentConversations.find((item) => item.id === unrelatedConversation.id)).toBe(unrelatedConversation)
+    expect(state.activeAgentConversationId).toBe(latestConversation.id)
+    expect(state.agentEditingRoundId).toBeNull()
+    expect(state.tasks.map((item) => item.id)).toEqual(['task-unrelated'])
+    expect(result).toBe('deleted')
+  })
+
+  it('deletes an assistant message using latest associations and cleans mismatched references', async () => {
+    const deleteAssistantMessage = useStore.getState().deleteAgentAssistantMessage
+    const now = vi.spyOn(Date, 'now').mockReturnValue(20)
+    const latestConversation = agentConversation({
+      activeRoundId: 'round-2',
+      rounds: [
+        {
+          id: 'round-1',
+          index: 1,
+          parentRoundId: null,
+          userMessageId: 'user-1',
+          assistantMessageId: 'assistant-a',
+          prompt: '第一轮',
+          inputImageIds: [],
+          outputTaskIds: ['task-message', 'task-keep'],
+          status: 'done',
+          error: null,
+          createdAt: 1,
+          finishedAt: 2,
+        },
+        {
+          id: 'round-2',
+          index: 2,
+          parentRoundId: 'round-1',
+          userMessageId: 'user-2',
+          assistantMessageId: 'assistant-a',
+          prompt: '第二轮',
+          inputImageIds: [],
+          outputTaskIds: ['task-round', 'task-missing'],
+          status: 'done',
+          error: null,
+          createdAt: 3,
+          finishedAt: 4,
+        },
+      ],
+      messages: [
+        { id: 'user-1', role: 'user', content: '第一轮', roundId: 'round-1', createdAt: 1 },
+        { id: 'user-2', role: 'user', content: '第二轮', roundId: 'round-2', createdAt: 3 },
+        { id: 'assistant-a', role: 'assistant', content: '待删除', roundId: 'round-2', outputTaskIds: ['task-message', 'task-missing'], createdAt: 4 },
+        { id: 'assistant-keep', role: 'assistant', content: '保留', roundId: 'round-1', outputTaskIds: ['task-round', 'task-keep'], createdAt: 5 },
+      ],
+    })
+    useStore.setState({
+      agentConversations: [latestConversation],
+      agentEditingRoundId: 'round-2',
+      tasks: [
+        task({ id: 'task-round', sourceMode: 'agent', agentConversationId: latestConversation.id, agentRoundId: 'round-2' }),
+        task({ id: 'task-message', sourceMode: 'agent', agentConversationId: latestConversation.id, agentMessageId: 'assistant-a' }),
+        task({ id: 'task-keep' }),
+      ],
+    })
+    vi.mocked(commitTaskDeletion).mockClear()
+
+    const result = await deleteAssistantMessage(latestConversation.id, 'assistant-a')
+
+    const state = useStore.getState()
+    const updated = state.agentConversations[0]
+    expect(updated.updatedAt).toBe(20)
+    expect(updated.rounds.every((item) => item.assistantMessageId === undefined)).toBe(true)
+    expect(updated.rounds[0].outputTaskIds).toEqual(['task-keep'])
+    expect(updated.rounds[1].outputTaskIds).toEqual([])
+    expect(updated.messages.map((message) => message.id)).toEqual(['user-1', 'user-2', 'assistant-keep'])
+    expect(updated.messages.find((message) => message.id === 'assistant-keep')?.outputTaskIds).toEqual(['task-keep'])
+    expect(state.tasks.map((item) => item.id)).toEqual(['task-keep'])
+    expect(state.agentEditingRoundId).toBe('round-2')
+    expect(result).toBe('deleted')
+    const commitCalls = vi.mocked(commitTaskDeletion).mock.calls
+    const storedConversation = commitCalls[commitCalls.length - 1]?.[2][0]
+    expect(storedConversation).toEqual(updated)
+    now.mockRestore()
+  })
+
+  it('rejects deletion while the round is running without changing tasks or persistence', async () => {
+    const conversation = agentConversation({
+      activeRoundId: 'round-running',
+      rounds: [{
+        id: 'round-running',
+        index: 1,
+        parentRoundId: null,
+        userMessageId: 'user-running',
+        prompt: '生成中',
+        inputImageIds: [],
+        outputTaskIds: ['task-running'],
+        status: 'running',
+        error: null,
+        createdAt: 1,
+        finishedAt: null,
+      }],
+      messages: [{ id: 'user-running', role: 'user', content: '生成中', roundId: 'round-running', createdAt: 1 }],
+    })
+    const runningTask = task({
+      id: 'task-running',
+      sourceMode: 'agent',
+      agentConversationId: conversation.id,
+      agentRoundId: 'round-running',
+      status: 'running',
+      finishedAt: null,
+    })
+    useStore.setState({ agentConversations: [conversation], tasks: [runningTask] })
+    vi.mocked(commitTaskDeletion).mockClear()
+
+    const result = await useStore.getState().deleteAgentRound(conversation.id, 'round-running')
+
+    expect(result).toBe('running')
+    expect(useStore.getState().agentConversations[0]).toBe(conversation)
+    expect(useStore.getState().tasks).toEqual([runningTask])
+    expect(commitTaskDeletion).not.toHaveBeenCalled()
+  })
+
+  it('does nothing when the assistant message disappeared after confirmation', async () => {
+    const conversation = agentConversation({
+      activeRoundId: 'round-a',
+      rounds: [{
+        id: 'round-a',
+        index: 1,
+        parentRoundId: null,
+        userMessageId: 'user-a',
+        prompt: '保留',
+        inputImageIds: [],
+        outputTaskIds: ['task-a'],
+        status: 'done',
+        error: null,
+        createdAt: 1,
+        finishedAt: 2,
+      }],
+      messages: [{ id: 'user-a', role: 'user', content: '保留', roundId: 'round-a', createdAt: 1 }],
+    })
+    const remainingTask = task({ id: 'task-a', sourceMode: 'agent', agentConversationId: conversation.id, agentRoundId: 'round-a' })
+    useStore.setState({ agentConversations: [conversation], tasks: [remainingTask] })
+    vi.mocked(commitTaskDeletion).mockClear()
+
+    const result = await useStore.getState().deleteAgentAssistantMessage(conversation.id, 'assistant-gone')
+
+    expect(result).toBe('not-found')
+    expect(useStore.getState().tasks).toEqual([remainingTask])
+    expect(commitTaskDeletion).not.toHaveBeenCalled()
+  })
+
+  it('does not overwrite state added while the deletion transaction is pending', async () => {
+    const conversation = agentConversation({
+      activeRoundId: 'round-a',
+      rounds: [{
+        id: 'round-a',
+        index: 1,
+        parentRoundId: null,
+        userMessageId: 'user-a',
+        prompt: '删除',
+        inputImageIds: [],
+        outputTaskIds: ['task-a'],
+        status: 'done',
+        error: null,
+        createdAt: 1,
+        finishedAt: 2,
+      }],
+      messages: [{ id: 'user-a', role: 'user', content: '删除', roundId: 'round-a', createdAt: 1 }],
+    })
+    useStore.setState({
+      agentConversations: [conversation],
+      tasks: [task({ id: 'task-a', sourceMode: 'agent', agentConversationId: conversation.id, agentRoundId: 'round-a' })],
+    })
+    let releaseCommit: (() => void) | undefined
+    vi.mocked(commitTaskDeletion).mockImplementationOnce((...args) => new Promise((resolve) => {
+      releaseCommit = () => {
+        void commitTaskDeletionImplementation(...args).then(resolve)
+      }
+    }))
+
+    const deletion = useStore.getState().deleteAgentRound(conversation.id, 'round-a')
+    useStore.setState((state) => ({
+      agentConversations: state.agentConversations.map((item) => item.id === conversation.id
+        ? {
+            ...item,
+            activeRoundId: 'round-concurrent',
+            rounds: [...item.rounds, {
+              id: 'round-concurrent',
+              index: 1,
+              parentRoundId: null,
+              userMessageId: 'message-concurrent',
+              prompt: '并发写入',
+              inputImageIds: [],
+              outputTaskIds: [],
+              status: 'done' as const,
+              error: null,
+              createdAt: 10,
+              finishedAt: 11,
+            }],
+            messages: [...item.messages, { id: 'message-concurrent', role: 'user' as const, content: '并发写入', roundId: 'round-concurrent', createdAt: 10 }],
+          }
+        : item),
+      tasks: [task({ id: 'task-concurrent' }), ...state.tasks],
+    }))
+    releaseCommit?.()
+
+    expect(await deletion).toBe('deleted')
+    expect(useStore.getState().tasks.map((item) => item.id)).toEqual(['task-concurrent'])
+    expect(useStore.getState().agentConversations[0].rounds.map((round) => round.id)).toEqual(['round-concurrent'])
+    expect(useStore.getState().agentConversations[0].messages.map((message) => message.id)).toEqual(['message-concurrent'])
+  })
+
+  it('reports a warning when both atomic persistence and its fallback fail after deletion', async () => {
+    const conversation = agentConversation({
+      activeRoundId: 'round-a',
+      rounds: [{
+        id: 'round-a',
+        index: 1,
+        parentRoundId: null,
+        userMessageId: 'user-a',
+        prompt: '删除',
+        inputImageIds: [],
+        outputTaskIds: ['task-a'],
+        status: 'done',
+        error: null,
+        createdAt: 1,
+        finishedAt: 2,
+      }],
+      messages: [{ id: 'user-a', role: 'user', content: '删除', roundId: 'round-a', createdAt: 1 }],
+    })
+    useStore.setState({
+      agentConversations: [conversation],
+      tasks: [task({ id: 'task-a', sourceMode: 'agent', agentConversationId: conversation.id, agentRoundId: 'round-a' })],
+    })
+    vi.mocked(commitTaskDeletion).mockRejectedValueOnce(new Error('atomic failed'))
+    vi.mocked(deleteDbTask).mockRejectedValueOnce(new Error('fallback failed'))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const result = await useStore.getState().deleteAgentRound(conversation.id, 'round-a')
+
+    expect(result).toBe('deleted-with-warning')
+    expect(useStore.getState().tasks).toEqual([])
+    expect(useStore.getState().agentConversations[0].rounds).toEqual([])
+    expect(warn).toHaveBeenCalledWith('Agent 轮次已删除，但持久化或图片清理失败', expect.any(Error))
+    warn.mockRestore()
+    vi.mocked(commitTaskDeletion).mockImplementation(commitTaskDeletionImplementation)
+    vi.mocked(deleteDbTask).mockImplementation(deleteDbTaskImplementation)
+  })
+
+  it('reports a warning when image cleanup fails after persistence succeeds', async () => {
+    const conversation = agentConversation({
+      activeRoundId: 'round-a',
+      rounds: [{
+        id: 'round-a',
+        index: 1,
+        parentRoundId: null,
+        userMessageId: 'user-a',
+        prompt: '删除',
+        inputImageIds: [],
+        outputTaskIds: ['task-a'],
+        status: 'done',
+        error: null,
+        createdAt: 1,
+        finishedAt: 2,
+      }],
+      messages: [{ id: 'user-a', role: 'user', content: '删除', roundId: 'round-a', createdAt: 1 }],
+    })
+    const imageId = 'image-cleanup-failure'
+    await putImage({ id: imageId, dataUrl: 'data:image/png;base64,cleanup', source: 'generated' })
+    useStore.setState({
+      agentConversations: [conversation],
+      tasks: [task({
+        id: 'task-a',
+        sourceMode: 'agent',
+        agentConversationId: conversation.id,
+        agentRoundId: 'round-a',
+        outputImages: [imageId],
+      })],
+    })
+    vi.mocked(commitTaskDeletion).mockImplementation(commitTaskDeletionImplementation)
+    vi.mocked(deleteDbImage).mockRejectedValueOnce(new Error('image cleanup failed'))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const result = await useStore.getState().deleteAgentRound(conversation.id, 'round-a')
+
+    expect(result).toBe('deleted-with-warning')
+    expect(useStore.getState().tasks).toEqual([])
+    expect(useStore.getState().agentConversations[0].rounds).toEqual([])
+    expect(await getImage(imageId)).toBeDefined()
+    expect(warn).toHaveBeenCalledWith('Agent 轮次已删除，但持久化或图片清理失败', expect.any(Error))
+    warn.mockRestore()
+    vi.mocked(deleteDbImage).mockImplementation(deleteDbImageImplementation)
+    await clearImages()
   })
 
   it('collects agent round and conversation tasks even when some failed tasks are not in outputTaskIds', () => {
@@ -3681,6 +4145,41 @@ describe('agent built-in image tool failure', () => {
     expect(round).toMatchObject({ status: 'error', error: '已停止生成。' })
     expect(JSON.stringify(round.responseOutput)).not.toContain('ig-deleted-abort')
     expect(JSON.stringify(round.responseOutput)).not.toContain('late-abort-base64')
+  })
+
+  it('deletes a stopped round while its aborted controller is still awaiting cleanup', async () => {
+    const response = deferred<Awaited<ReturnType<typeof callAgentResponsesApi>>>()
+    vi.mocked(callAgentResponsesApi).mockImplementationOnce(() => response.promise)
+    vi.mocked(commitTaskDeletion).mockImplementation(commitTaskDeletionImplementation)
+
+    await submitAgentMessage()
+    await vi.waitFor(() => expect(callAgentResponsesApi).toHaveBeenCalledTimes(1))
+    const roundId = useStore.getState().agentConversations[0].rounds[0].id
+    stopAgentResponse('conversation-a')
+    expect(useStore.getState().agentConversations[0].rounds[0]).toMatchObject({
+      status: 'error',
+      error: '已停止生成。',
+    })
+
+    const result = await useStore.getState().deleteAgentRound('conversation-a', roundId)
+
+    expect(result).toBe('deleted')
+    expect(useStore.getState().agentConversations[0].rounds).toEqual([])
+    expect(useStore.getState().agentConversations[0].messages).toEqual([])
+    expect(useStore.getState().tasks).toEqual([])
+
+    response.resolve({
+      text: '不应复活',
+      images: [],
+      outputItems: [{ type: 'message', content: [{ type: 'output_text', text: '不应复活' }] }],
+      responseId: 'late-response',
+    })
+    await response.promise
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(useStore.getState().agentConversations[0].rounds).toEqual([])
+    expect(useStore.getState().agentConversations[0].messages).toEqual([])
+    expect(useStore.getState().tasks).toEqual([])
   })
 
   it('cleans late response output when Agent execution pauses for recovery', async () => {

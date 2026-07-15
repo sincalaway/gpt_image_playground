@@ -58,7 +58,7 @@ import { cacheImage, cacheThumbnail, clearImageCaches, deleteCachedImage, delete
 import { hasActiveDataOperations } from './lib/dataOperations'
 import { formatExportFileTime } from './lib/exportFileName'
 import { buildExportZip, createExportBlob, getExportImageEstimatedBytes, getExportZipPlan, MAX_EXPORT_ZIP_BYTES, readExportZip, readExportZipFileAsDataUrl, readExportZipManifest } from './lib/exportZip'
-import { getActiveAgentRounds, getAgentRoundPath, normalizeAgentConversations, uniqueIds } from './lib/agentConversationState'
+import { deleteAgentRoundFromConversation, getActiveAgentRounds, getAgentRoundPath, normalizeAgentConversations, remapAgentRoundMentionsForPathChange, uniqueIds } from './lib/agentConversationState'
 import { canonicalizeBatchFunctionCallArguments, countResponseToolCalls, createReadyAgentRecoveredToolState, getAgentFunctionOutputCallIds, getAgentRecoveredFailureError, getAgentRecoveredToolCallCount, getAgentRoundResponseOutput, getPersistableAgentConversations, getPersistableRawResponsePayload, mergeResponseOutputItems, sanitizeResponseOutputForInput, scrubResponseOutputForDeletedAgentTasks, scrubTaskRawResponsePayloadForDeletedTasks, stripPersistedAgentConversations } from './lib/agentResponseState'
 
 export const ALL_FAVORITES_COLLECTION_ID = '__all_favorites__'
@@ -83,6 +83,7 @@ const AGENT_RECOVERY_PAUSE_ERROR = 'AgentRecoveryPauseError'
 const AGENT_CONVERSATION_TITLE_MAX_LENGTH = 28
 const ERROR_TOAST_MAX_LENGTH = 80
 type ToastType = 'info' | 'success' | 'error'
+type AgentDeletionResult = 'deleted' | 'deleted-with-warning' | 'running' | 'not-found'
 type AgentInputDraft = {
   prompt: string
   inputImages: InputImage[]
@@ -495,6 +496,8 @@ interface AppState {
   setActiveAgentRoundId: (conversationId: string, roundId: string | null) => void
   renameAgentConversation: (id: string, title: string) => void
   deleteAgentConversation: (id: string) => void
+  deleteAgentRound: (conversationId: string, roundId: string) => Promise<AgentDeletionResult>
+  deleteAgentAssistantMessage: (conversationId: string, messageId: string) => Promise<AgentDeletionResult>
   setAgentSidebarCollapsed: (collapsed: boolean) => void
   setAgentAssetTab: (tab: 'references' | 'outputs') => void
   setAgentAssetPanelCollapsed: (collapsed: boolean) => void
@@ -580,7 +583,8 @@ interface AppState {
     minConfirmDelayMs?: number
     messageAlign?: 'left' | 'center'
     tone?: 'danger' | 'warning'
-    action?: (checkboxChecked?: boolean) => void
+    awaitAction?: boolean
+    action?: (checkboxChecked?: boolean) => void | boolean | Promise<void | boolean>
     cancelAction?: (checkboxChecked?: boolean) => void
   } | null
   setConfirmDialog: (d: AppState['confirmDialog']) => void
@@ -1149,6 +1153,8 @@ export const useStore = create<AppState>()(
           ...(activeDeleted ? clearInputDraftState() : {}),
         }
       }),
+      deleteAgentRound: (conversationId, roundId) => deleteAgentRoundAndTasks(conversationId, roundId),
+      deleteAgentAssistantMessage: (conversationId, messageId) => deleteAgentAssistantMessageAndTasks(conversationId, messageId),
       setAgentSidebarCollapsed: (agentSidebarCollapsed) => set({ agentSidebarCollapsed }),
       setAgentAssetTab: (agentAssetTab) => set({ agentAssetTab }),
       setAgentAssetPanelCollapsed: (agentAssetPanelCollapsed) => set({ agentAssetPanelCollapsed }),
@@ -4587,7 +4593,166 @@ export async function editOutputs(task: TaskRecord) {
   showToast(`已添加 ${added} 张输出图到输入`, 'success')
 }
 
-async function removeTasks(taskIds: string[]) {
+function getAgentRoundDeletionTaskIds(conversation: AgentConversation, round: AgentRound, tasks: TaskRecord[]) {
+  const messageIds = new Set(conversation.messages.filter((message) => message.roundId === round.id).map((message) => message.id))
+  messageIds.add(round.userMessageId)
+  if (round.assistantMessageId) messageIds.add(round.assistantMessageId)
+  return uniqueIds([
+    ...round.outputTaskIds,
+    ...conversation.messages
+      .filter((message) => messageIds.has(message.id))
+      .flatMap((message) => message.outputTaskIds ?? []),
+    ...tasks
+      .filter((task) => task.agentRoundId === round.id || Boolean(task.agentMessageId && messageIds.has(task.agentMessageId)))
+      .map((task) => task.id),
+  ])
+}
+
+function hasRunningAgentDeletionWork(conversationId: string, roundIds: Set<string>, taskIds: Set<string>, state: AppState) {
+  const conversation = state.agentConversations.find((item) => item.id === conversationId)
+  if (conversation?.rounds.some((round) => roundIds.has(round.id) && round.status === 'running')) return true
+  if (state.tasks.some((task) => taskIds.has(task.id) && task.status === 'running')) return true
+  for (const roundId of roundIds) {
+    const key = getAgentRoundControllerKey(conversationId, roundId)
+    const round = conversation?.rounds.find((item) => item.id === roundId)
+    const controller = agentRoundControllers.get(key)
+    if (controller && !controller.signal.aborted) return true
+    if (agentRecoveryContinuations.has(key) && round?.status !== 'done' && round?.error !== AGENT_STOPPED_MESSAGE) return true
+  }
+  return false
+}
+
+function cleanDeletedAgentReferences(conversation: AgentConversation, taskIds: Set<string>, assistantMessageIds: Set<string>, now: number) {
+  let changed = false
+  const rounds = conversation.rounds.map((round) => {
+    const outputTaskIds = round.outputTaskIds.filter((taskId) => !taskIds.has(taskId))
+    const clearAssistantMessage = Boolean(round.assistantMessageId && assistantMessageIds.has(round.assistantMessageId))
+    if (outputTaskIds.length === round.outputTaskIds.length && !clearAssistantMessage) return round
+    changed = true
+    return {
+      ...round,
+      ...(clearAssistantMessage ? { assistantMessageId: undefined } : {}),
+      outputTaskIds,
+    }
+  })
+  const messages = conversation.messages.map((message) => {
+    if (!message.outputTaskIds?.some((taskId) => taskIds.has(taskId))) return message
+    changed = true
+    return { ...message, outputTaskIds: message.outputTaskIds.filter((taskId) => !taskIds.has(taskId)) }
+  })
+  return changed ? { ...conversation, rounds, messages, updatedAt: now } : conversation
+}
+
+async function deleteAgentRoundAndTasks(conversationId: string, roundId: string): Promise<AgentDeletionResult> {
+  const state = useStore.getState()
+  const conversation = state.agentConversations.find((item) => item.id === conversationId)
+  const round = conversation?.rounds.find((item) => item.id === roundId)
+  if (!conversation || !round) return 'not-found'
+
+  const taskIds = new Set(getAgentRoundDeletionTaskIds(conversation, round, state.tasks))
+  if (hasRunningAgentDeletionWork(conversationId, new Set([roundId]), taskIds, state)) return 'running'
+
+  let deleted = false
+  try {
+    await removeTasks([...taskIds], (latest, deletedTaskIds) => {
+      const latestConversation = latest.agentConversations.find((item) => item.id === conversationId)
+      const latestRound = latestConversation?.rounds.find((item) => item.id === roundId)
+      if (!latestConversation || !latestRound) return null
+
+      const oldActivePath = getActiveAgentRounds(latestConversation)
+      const nextConversation = deleteAgentRoundFromConversation(latestConversation, roundId)
+      const newActivePath = getActiveAgentRounds(nextConversation)
+      const removedMessageIds = new Set([
+        latestRound.userMessageId,
+        ...(latestRound.assistantMessageId ? [latestRound.assistantMessageId] : []),
+        ...latestConversation.messages.filter((message) => message.roundId === roundId).map((message) => message.id),
+      ])
+      const removedAssistantMessageIds = new Set(latestConversation.messages
+        .filter((message) => message.role === 'assistant' && removedMessageIds.has(message.id))
+        .map((message) => message.id))
+      if (latestRound.assistantMessageId) removedAssistantMessageIds.add(latestRound.assistantMessageId)
+      const now = Date.now()
+      const agentConversations = latest.agentConversations.map((item) => {
+        const candidate = item.id === conversationId
+          ? { ...nextConversation, messages: nextConversation.messages.filter((message) => !removedMessageIds.has(message.id)) }
+          : item
+        return cleanDeletedAgentReferences(candidate, deletedTaskIds, removedAssistantMessageIds, now)
+      })
+      const draft = latest.agentInputDrafts[conversationId]
+      const agentInputDrafts = draft
+        ? {
+            ...latest.agentInputDrafts,
+            [conversationId]: {
+              ...draft,
+              prompt: remapAgentRoundMentionsForPathChange(draft.prompt, oldActivePath, newActivePath),
+            },
+          }
+        : latest.agentInputDrafts
+      deleted = true
+      return {
+        agentConversations,
+        agentInputDrafts,
+        ...(latest.activeAgentConversationId === conversationId && latest.appMode === 'agent'
+          ? { prompt: remapAgentRoundMentionsForPathChange(latest.prompt, oldActivePath, newActivePath) }
+          : {}),
+        agentEditingRoundId: latest.agentEditingRoundId === roundId ? null : latest.agentEditingRoundId,
+      }
+    })
+  } catch (err) {
+    if (!deleted) throw err
+    console.warn('Agent 轮次已删除，但持久化或图片清理失败', err)
+    return 'deleted-with-warning'
+  }
+  return deleted ? 'deleted' : 'not-found'
+}
+
+async function deleteAgentAssistantMessageAndTasks(conversationId: string, messageId: string): Promise<AgentDeletionResult> {
+  const state = useStore.getState()
+  const conversation = state.agentConversations.find((item) => item.id === conversationId)
+  const message = conversation?.messages.find((item) => item.id === messageId && item.role === 'assistant')
+  if (!conversation || !message) return 'not-found'
+
+  const round = conversation.rounds.find((item) => item.id === message.roundId)
+  const taskIds = new Set(uniqueIds([
+    ...(message.outputTaskIds ?? []),
+    ...(round ? getAgentRoundDeletionTaskIds(conversation, round, state.tasks) : []),
+    ...state.tasks.filter((task) => task.agentMessageId === messageId).map((task) => task.id),
+  ]))
+  const referencedRoundIds = new Set([
+    message.roundId,
+    ...conversation.rounds.filter((item) => item.assistantMessageId === messageId).map((item) => item.id),
+  ])
+  if (hasRunningAgentDeletionWork(conversationId, referencedRoundIds, taskIds, state)) return 'running'
+
+  let deleted = false
+  try {
+    await removeTasks([...taskIds], (latest, deletedTaskIds) => {
+      const latestConversation = latest.agentConversations.find((item) => item.id === conversationId)
+      const latestMessage = latestConversation?.messages.find((item) => item.id === messageId && item.role === 'assistant')
+      if (!latestConversation || !latestMessage) return null
+
+      const now = Date.now()
+      const assistantMessageIds = new Set([messageId])
+      const agentConversations = latest.agentConversations.map((item) => {
+        const candidate = item.id === conversationId
+          ? { ...item, messages: item.messages.filter((current) => current.id !== messageId), updatedAt: now }
+          : item
+        return cleanDeletedAgentReferences(candidate, deletedTaskIds, assistantMessageIds, now)
+      })
+      deleted = true
+      return { agentConversations }
+    })
+  } catch (err) {
+    if (!deleted) throw err
+    console.warn('Agent 消息已删除，但持久化或图片清理失败', err)
+    return 'deleted-with-warning'
+  }
+  return deleted ? 'deleted' : 'not-found'
+}
+
+type TaskDeletionStateUpdater = (state: AppState, taskIds: Set<string>) => Partial<AppState> | null
+
+async function removeTasks(taskIds: string[], updateState?: TaskDeletionStateUpdater) {
   const toDelete = new Set(taskIds)
   let deletedTasks: TaskRecord[] = []
   useStore.setState((state) => {
@@ -4605,7 +4770,7 @@ async function removeTasks(taskIds: string[]) {
       streamPreviewSlots,
     }
   })
-  if (deletedTasks.length === 0) return 0
+  if (deletedTasks.length === 0 && !updateState) return 0
 
   const deletedImageIds = new Set<string>()
   for (const task of deletedTasks) {
@@ -4620,7 +4785,24 @@ async function removeTasks(taskIds: string[]) {
   }
 
   const cleanup = scrubAgentOutputPayloadsForDeletedTasks(deletedTasks)
-  await persistTaskDeletionCleanup(deletedTasks.map((task) => task.id), cleanup)
+  const domainUpdatedConversations: AgentConversation[] = []
+  if (updateState) {
+    useStore.setState((state) => {
+      const patch = updateState(state, toDelete)
+      if (!patch) return state
+      if (patch.agentConversations) {
+        const previousById = new Map(state.agentConversations.map((conversation) => [conversation.id, conversation]))
+        domainUpdatedConversations.push(...patch.agentConversations.filter((conversation) => previousById.get(conversation.id) !== conversation))
+      }
+      return patch
+    })
+  }
+  const updatedConversations = new Map(cleanup.updatedConversations.map((conversation) => [conversation.id, conversation]))
+  for (const conversation of domainUpdatedConversations) updatedConversations.set(conversation.id, conversation)
+  await persistTaskDeletionCleanup(deletedTasks.map((task) => task.id), {
+    ...cleanup,
+    updatedConversations: [...updatedConversations.values()],
+  })
   await deleteUnreferencedImageIds(deletedImageIds)
   return deletedTasks.length
 }
