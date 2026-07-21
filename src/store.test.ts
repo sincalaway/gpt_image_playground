@@ -2256,6 +2256,80 @@ describe('data import', () => {
     expect(await getImage('multipart-image-b')).toMatchObject({ dataUrl: 'data:image/png;base64,AwQ=' })
   })
 
+  it('imports multiple regular backups together', async () => {
+    await clearTasks()
+    await clearImages()
+    const sharedCollection = { id: 'regular-collection-shared', name: '共享收藏夹', createdAt: 1, updatedAt: 1 }
+    const collectionA = { id: 'regular-collection-a', name: '普通备份 A', createdAt: 1, updatedAt: 1 }
+    const collectionB = { id: 'regular-collection-b', name: '普通备份 B', createdAt: 2, updatedAt: 2 }
+    const sharedTask = task({ id: 'regular-task-shared', outputImages: ['regular-image-shared'] })
+    const backupA = importFile({
+      version: 3,
+      exportedAt: new Date(0).toISOString(),
+      tasks: [sharedTask, task({ id: 'regular-task-a', outputImages: ['regular-image-a'], favoriteCollectionIds: [collectionA.id], isFavorite: true })],
+      favoriteCollections: [sharedCollection, collectionA],
+      defaultFavoriteCollectionId: collectionA.id,
+      imageFiles: {
+        'regular-image-shared': { path: 'images/shared.png' },
+        'regular-image-a': { path: 'images/image-a.png' },
+      },
+    }, {
+      'images/shared.png': new Uint8Array([5, 6]),
+      'images/image-a.png': new Uint8Array([1, 2]),
+    })
+    const backupB = importFile({
+      version: 3,
+      exportedAt: new Date(1).toISOString(),
+      tasks: [sharedTask, task({ id: 'regular-task-b', outputImages: ['regular-image-b'], favoriteCollectionIds: [collectionB.id], isFavorite: true })],
+      favoriteCollections: [sharedCollection, collectionB],
+      defaultFavoriteCollectionId: collectionB.id,
+      imageFiles: {
+        'regular-image-shared': { path: 'images/shared.png' },
+        'regular-image-b': { path: 'images/image-b.png' },
+      },
+    }, {
+      'images/shared.png': new Uint8Array([5, 6]),
+      'images/image-b.png': new Uint8Array([3, 4]),
+    })
+
+    const imported = await importData([backupA, backupB], { importConfig: false, importTasks: true })
+
+    const state = useStore.getState()
+    const taskIds = (await getAllTasks()).map((item) => item.id)
+    const collectionIds = state.favoriteCollections.map((collection) => collection.id)
+    expect(imported).toBe(true)
+    expect(taskIds).toEqual(expect.arrayContaining(['regular-task-shared', 'regular-task-a', 'regular-task-b']))
+    expect(taskIds.filter((id) => id === sharedTask.id)).toHaveLength(1)
+    expect(await getImage('regular-image-shared')).toMatchObject({ dataUrl: 'data:image/png;base64,BQY=' })
+    expect(await getImage('regular-image-a')).toMatchObject({ dataUrl: 'data:image/png;base64,AQI=' })
+    expect(await getImage('regular-image-b')).toMatchObject({ dataUrl: 'data:image/png;base64,AwQ=' })
+    expect(collectionIds).toEqual(expect.arrayContaining([sharedCollection.id, collectionA.id, collectionB.id]))
+    expect(collectionIds.filter((id) => id === sharedCollection.id)).toHaveLength(1)
+  })
+
+  it('deduplicates shared config when merging multiple regular backups', async () => {
+    const sharedProfile = createDefaultOpenAIProfile({ id: 'regular-profile-shared', name: '共享配置', apiKey: 'shared-key' })
+    const profileA = createDefaultOpenAIProfile({ id: 'regular-profile-a', name: '普通配置 A', apiKey: 'key-a' })
+    const profileB = createDefaultOpenAIProfile({ id: 'regular-profile-b', name: '普通配置 B', apiKey: 'key-b' })
+    const backupA = importFile({
+      version: 3,
+      exportedAt: new Date(0).toISOString(),
+      settings: normalizeSettings({ ...DEFAULT_SETTINGS, profiles: [sharedProfile, profileA], activeProfileId: profileA.id }),
+    })
+    const backupB = importFile({
+      version: 3,
+      exportedAt: new Date(1).toISOString(),
+      settings: normalizeSettings({ ...DEFAULT_SETTINGS, profiles: [sharedProfile, profileB], activeProfileId: profileB.id }),
+    })
+
+    const imported = await importData([backupA, backupB], { importConfig: true, importTasks: false })
+
+    const apiKeys = useStore.getState().settings.profiles.map((profile) => profile.apiKey)
+    expect(imported).toBe(true)
+    expect(apiKeys).toEqual(expect.arrayContaining(['shared-key', 'key-a', 'key-b']))
+    expect(apiKeys.filter((apiKey) => apiKey === 'shared-key')).toHaveLength(1)
+  })
+
   it('rejects an incomplete multipart backup before importing data', async () => {
     await clearTasks()
     const part1 = importFile({
